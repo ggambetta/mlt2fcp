@@ -18,9 +18,12 @@ import sys
 from bs4 import BeautifulSoup
 
 # Whether to turn an embedded .kdenlive file into a compound clip, or leave it alone.
-# Doesn't work in all cases. Workaround is to convert the embedded .kdenlive independently,
+# Doesn't work in all cases. A possible workaround is to convert the embedded .kdenlive independently,
 # import it as a timeline in Resolve, and replacing the missing clip with the imported timeline.
 EMBEDDED_MLT_TO_COMPOUND_CLIP = False
+
+# Unclear whether these are necessary, since every clip has an absolute offset anyway.
+ADD_GAP_NODES = True
 
 # =============================================================================
 #  Data model.
@@ -155,6 +158,8 @@ class KdenliveReader:
         clip_name_attr = selectFirst(producer, "property[name=kdenlive:clipname]")
         if clip_name_attr:
           clip_name = clip_name_attr.text
+          if not clip_name:
+            clip_name = clip_id
 
         if EMBEDDED_MLT_TO_COMPOUND_CLIP and resource_path.endswith(".kdenlive"):
           reader = KdenliveReader()
@@ -268,12 +273,13 @@ class FcpXmlWriter:
     embedded_project = clip.resource
     writer = FcpXmlWriter(embedded_project)
     if embedded_project not in self.added_embedded_resources:
+      self.added_embedded_resources.add(embedded_project)
       writer._addResources(resources_tag)
 
     media = self._addTag(resources_tag, "media")
     media["name"] = clip.name
     media["id"] = clip_id
-    writer._addSequence(media)
+    writer._addSequence(media, True)
 
 
   def _addLibrary(self, library_tag):
@@ -281,18 +287,33 @@ class FcpXmlWriter:
     event["name"] = "Timeline 1"
     project_tag = self._addTag(event, "project")
     project_tag["name"] = "Timeline 1"
-    self._addSequence(project_tag)
+    self._addSequence(project_tag, False)
 
 
-  def _addSequence(self, project_tag):
+  def _addSequence(self, project_tag, wrap_in_clip):
     sequence = self._addTag(project_tag, "sequence")
     sequence["format"] = "r0"
     spine = self._addTag(sequence, "spine")
 
+    if wrap_in_clip:
+      wrapper = self._addTag(spine, "clip")
+      wrapper["duration"] = self._formatTime(self._getProjectLength())
+    else:
+      wrapper = spine
+
     index = 0
     for track in self.project.tracks:
-      self._addTrack(track, spine, index)
+      self._addTrack(track, wrapper, index)
       index += 1
+
+
+  # Computes the project length, given by the latest out-time it contains.
+  def _getProjectLength(self):
+    latest_out = 0
+    for track in self.project.tracks:
+      for entry in track.entries:
+        latest_out = max(latest_out, entry.out_time)
+    return latest_out
 
 
   def _addTrack(self, track, spine, index):
@@ -302,26 +323,25 @@ class FcpXmlWriter:
       duration = entry.out_time - entry.in_time
 
       if clip is None:
-        clip_node = self._addTag(spine, "gap")
+        if ADD_GAP_NODES:
+          clip_node = self._addTag(spine, "gap")
+        else:
+          offset += duration
+          continue
       else:
         resource = clip.resource
         if isinstance(resource, ClipFile):
-          clip_node = self._addTag(spine, "clip")
-          clip_node["name"] = clip.name
-          clip_node["enabled"] = 1
-
+          clip_tag_name = "audio" if track.is_audio else "video"
+          clip_node = self._addTag(spine, clip_tag_name)
           one_frame_in_sec = 0.001 + 1.0 / self.project.frame_rate  # TODO: should use frame rate of clip
           duration += + one_frame_in_sec
-
-          inner_tag = "audio" if track.is_audio else "video"
-          inner = self._addTag(clip_node, inner_tag)
-          inner["ref"] = clip.clip_id
-          inner["duration"] = self._formatTime(clip.duration)
         elif isinstance(resource, Project):
           clip_node = self._addTag(spine, "ref-clip")
-          clip_node["ref"] = clip.clip_id
           clip_node["srcEnable"] = "audio" if track.is_audio else "video"
           self._addFakeTimemap(clip_node)
+
+        clip_node["name"] = clip.name
+        clip_node["ref"] = clip.clip_id
 
       clip_node["start"] = self._formatTime(entry.in_time)
       clip_node["duration"] = self._formatTime(duration)
